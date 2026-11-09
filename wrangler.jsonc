@@ -1,5 +1,5 @@
 {
-  "name": "sahadatlabs-assistant",
+  "name": "portfolio-assistant",
   "main": "worker.js",
   "compatibility_date": "2025-01-01",
   "vars": {
