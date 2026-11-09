@@ -1,0 +1,10 @@
+{
+  "name": "sahadatlabs-assistant",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+  "vars": {
+    "GH_OWNER": "Sahadat000",
+    "SITE_REPO": "My-portfolio",
+    "ALLOWED_ORIGIN": "https://sahadat000.github.io"
+  }
+}
