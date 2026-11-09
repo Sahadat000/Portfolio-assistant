@@ -1,8 +1,8 @@
 // SahadatLabs assistant backend (Cloudflare Worker)
-// Secrets: ASSISTANT_PASSWORD, SESSION_SECRET, GITHUB_WRITE_TOKEN, ANTHROPIC_API_KEY
-// Vars: GH_OWNER, SITE_REPO, ALLOWED_ORIGIN
+// Secrets: ASSISTANT_PASSWORD, SESSION_SECRET, GITHUB_WRITE_TOKEN, GEMINI_API_KEY
+// Vars: GH_OWNER, SITE_REPO, ALLOWED_ORIGIN, GEMINI_MODEL (optional)
 
-const MODEL = "claude-sonnet-5-5";
+const DEFAULT_MODEL = "gemini-3.5-flash";
 const SESSION_MS = 4 * 60 * 60 * 1000;
 const enc = new TextEncoder();
 
@@ -209,58 +209,86 @@ async function runTool(env, name, input, state) {
   return { error: "Unknown tool" };
 }
 
+function toGemini(schema) {
+  const out = { type: String(schema.type).toUpperCase() };
+  if (schema.description) out.description = schema.description;
+  if (schema.properties) {
+    out.properties = {};
+    for (const [k, v] of Object.entries(schema.properties)) out.properties[k] = toGemini(v);
+  }
+  if (schema.required) out.required = schema.required;
+  return out;
+}
+
+const GEMINI_TOOLS = [
+  {
+    functionDeclarations: TOOLS.map((t) => {
+      const d = { name: t.name, description: t.description };
+      const props = t.input_schema.properties;
+      if (props && Object.keys(props).length) d.parameters = toGemini(t.input_schema);
+      return d;
+    }),
+  },
+];
+
 async function chat(env, messages) {
-  const state = { changed: false };
-  let convo = messages;
+  const state = { changed: false, dispatched: false };
+  const model = env.GEMINI_MODEL || DEFAULT_MODEL;
+  const contents = messages.map((m) => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.content }],
+  }));
 
   for (let step = 0; step < 6; step++) {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "x-api-key": env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 1024,
-        system: SYSTEM,
-        tools: TOOLS,
-        messages: convo,
-      }),
-    });
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "x-goog-api-key": env.GEMINI_API_KEY,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: SYSTEM }] },
+          contents,
+          tools: GEMINI_TOOLS,
+        }),
+      }
+    );
     const data = await r.json();
-    if (!r.ok) throw new Error((data.error && data.error.message) || "Claude API error");
+    if (!r.ok) throw new Error((data.error && data.error.message) || "Gemini API error");
 
-    if (data.stop_reason !== "tool_use") {
-      return data.content
-        .filter((b) => b.type === "text")
-        .map((b) => b.text)
+    const cand = data.candidates && data.candidates[0];
+    const parts = (cand && cand.content && cand.content.parts) || [];
+    const calls = parts.filter((p) => p.functionCall);
+
+    if (!calls.length) {
+      const text = parts
+        .filter((p) => p.text && !p.thought)
+        .map((p) => p.text)
         .join("\n")
         .trim();
+      return text || "No reply. Please try again.";
     }
 
-    convo = [...convo, { role: "assistant", content: data.content }];
-    const results = [];
-    for (const block of data.content) {
-      if (block.type !== "tool_use") continue;
+    // Keep the model turn exactly as returned (it may carry thought signatures)
+    contents.push(cand.content);
+    const responses = [];
+    for (const p of calls) {
+      const { name, args } = p.functionCall;
       let out;
       try {
-        out = await runTool(env, block.name, block.input || {}, state);
-        if (state.changed && !state.dispatched && block.name !== "list_repos") {
+        out = await runTool(env, name, args || {}, state);
+        if (state.changed && !state.dispatched && name !== "list_repos") {
           state.dispatched = true;
           out = { ...out, site: await triggerSiteUpdate(env) };
         }
       } catch (e) {
         out = { error: e.message };
       }
-      results.push({
-        type: "tool_result",
-        tool_use_id: block.id,
-        content: JSON.stringify(out),
-      });
+      responses.push({ functionResponse: { name, response: { result: out } } });
     }
-    convo = [...convo, { role: "user", content: results }];
+    contents.push({ role: "user", parts: responses });
   }
   return "Too many steps. Please try a simpler command.";
 }
