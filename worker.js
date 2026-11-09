@@ -1,122 +1,220 @@
-// Cloudflare Worker: SahadatLabs assistant backend
-// Secrets (set in Cloudflare, NEVER in code):
-//   ASSISTANT_PASSWORD, SESSION_SECRET, GITHUB_WRITE_TOKEN, ANTHROPIC_API_KEY
-// Variables (plain): GH_OWNER=Sahadat000, SITE_REPO=My-portfolio,
-//   ALLOWED_ORIGIN=https://sahadat000.github.io
+// SahadatLabs assistant backend (Cloudflare Worker)
+// Secrets: ASSISTANT_PASSWORD, SESSION_SECRET, GITHUB_WRITE_TOKEN, ANTHROPIC_API_KEY
+// Vars: GH_OWNER, SITE_REPO, ALLOWED_ORIGIN
 
-const TOPIC = "portfolio";
-const SESSION_HOURS = 4;
+const MODEL = "claude-sonnet-5-5";
+const SESSION_MS = 4 * 60 * 60 * 1000;
 const enc = new TextEncoder();
 
-const cors = (env) => ({
-  "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN,
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-});
-const json = (env, obj, status = 200) =>
-  new Response(JSON.stringify(obj), {
-    status,
-    headers: { "Content-Type": "application/json", ...cors(env) },
-  });
+const b64u = (buf) =>
+  btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 
-// ---------- session tokens (HMAC signed) ----------
-async function hmac(secret, msg) {
-  const key = await crypto.subtle.importKey("raw", enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(msg));
-  return btoa(String.fromCharCode(...new Uint8Array(sig)));
+async function hmac(secret, data) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  return b64u(await crypto.subtle.sign("HMAC", key, enc.encode(data)));
 }
-async function makeToken(env) {
-  const exp = Date.now() + SESSION_HOURS * 3600 * 1000;
-  return exp + "." + (await hmac(env.SESSION_SECRET, String(exp)));
-}
-async function validToken(env, token) {
-  const [exp, sig] = (token || "").split(".");
-  if (!exp || !sig || Number(exp) < Date.now()) return false;
-  return safeEqual(sig, await hmac(env.SESSION_SECRET, exp));
-}
-function safeEqual(a, b) {
+
+function safeEq(a, b) {
   if (a.length !== b.length) return false;
   let r = 0;
   for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return r === 0;
 }
 
-// ---------- GitHub helpers ----------
-async function gh(env, path, method = "GET", body) {
-  const res = await fetch("https://api.github.com" + path, {
-    method,
+async function makeToken(env) {
+  const exp = String(Date.now() + SESSION_MS);
+  return exp + "." + (await hmac(env.SESSION_SECRET, exp));
+}
+
+async function checkToken(env, req) {
+  const h = req.headers.get("Authorization") || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : "";
+  const [exp, sig] = token.split(".");
+  if (!exp || !sig) return false;
+  if (!safeEq(sig, await hmac(env.SESSION_SECRET, exp))) return false;
+  return Number(exp) > Date.now();
+}
+
+function cors(env) {
+  return {
+    "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN,
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Vary": "Origin",
+  };
+}
+
+function json(env, data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", ...cors(env) },
+  });
+}
+
+async function gh(env, path, opts = {}) {
+  const r = await fetch("https://api.github.com" + path, {
+    ...opts,
     headers: {
       Authorization: "Bearer " + env.GITHUB_WRITE_TOKEN,
       Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
       "User-Agent": "sahadatlabs-assistant",
+      "X-GitHub-Api-Version": "2022-11-28",
       "Content-Type": "application/json",
     },
-    body: body ? JSON.stringify(body) : undefined,
   });
-  if (!res.ok) throw new Error("GitHub " + res.status + ": " + (await res.text()).slice(0, 200));
-  return res.status === 204 ? {} : res.json();
-}
-// Re-run the site's workflow so changes appear right away (best effort)
-async function refreshSite(env) {
+  const text = await r.text();
+  let body;
   try {
-    await gh(env, `/repos/${env.GH_OWNER}/${env.SITE_REPO}/actions/workflows/update.yml/dispatches`,
-      "POST", { ref: "main" });
-  } catch (e) { /* ignore: hourly run will pick it up */ }
+    body = JSON.parse(text);
+  } catch {
+    body = text;
+  }
+  if (!r.ok) throw new Error(r.status + " " + ((body && body.message) || text));
+  return body;
 }
 
-const tools = {
-  async list_repos(env) {
-    const repos = await gh(env, "/user/repos?per_page=100&affiliation=owner&sort=pushed");
-    return repos.filter((r) => !r.fork && !r.archived).map((r) => ({
-      name: r.name, private: r.private, description: r.description || "",
-      on_portfolio: (r.topics || []).includes(TOPIC),
-    }));
-  },
-  async add_to_portfolio(env, { repo }) {
-    const cur = await gh(env, `/repos/${env.GH_OWNER}/${repo}/topics`);
-    const names = [...new Set([...(cur.names || []), TOPIC])];
-    await gh(env, `/repos/${env.GH_OWNER}/${repo}/topics`, "PUT", { names });
-    await refreshSite(env);
-    return { ok: true, repo, topics: names };
-  },
-  async remove_from_portfolio(env, { repo }) {
-    const cur = await gh(env, `/repos/${env.GH_OWNER}/${repo}/topics`);
-    const names = (cur.names || []).filter((t) => t !== TOPIC);
-    await gh(env, `/repos/${env.GH_OWNER}/${repo}/topics`, "PUT", { names });
-    await refreshSite(env);
-    return { ok: true, repo, topics: names };
-  },
-  async set_description(env, { repo, text }) {
-    await gh(env, `/repos/${env.GH_OWNER}/${repo}`, "PATCH", { description: text });
-    await refreshSite(env);
-    return { ok: true, repo, description: text };
-  },
-};
+async function triggerSiteUpdate(env) {
+  try {
+    await gh(
+      env,
+      `/repos/${env.GH_OWNER}/${env.SITE_REPO}/actions/workflows/update.yml/dispatches`,
+      { method: "POST", body: JSON.stringify({ ref: "main" }) }
+    );
+    return "Site refresh started.";
+  } catch (e) {
+    return "Could not start site refresh (" + e.message + "). It will update on the next hourly run.";
+  }
+}
 
-const toolDefs = [
-  { name: "list_repos", description: "List the owner's repos with private flag, description and whether each is on the portfolio.",
-    input_schema: { type: "object", properties: {} } },
-  { name: "add_to_portfolio", description: "Show a repo on the portfolio site (adds the 'portfolio' topic).",
-    input_schema: { type: "object", properties: { repo: { type: "string" } }, required: ["repo"] } },
-  { name: "remove_from_portfolio", description: "Hide a repo from the portfolio site.",
-    input_schema: { type: "object", properties: { repo: { type: "string" } }, required: ["repo"] } },
-  { name: "set_description", description: "Set a repo's short English description (what it is used for).",
-    input_schema: { type: "object", properties: { repo: { type: "string" }, text: { type: "string" } }, required: ["repo", "text"] } },
+const TOOLS = [
+  {
+    name: "list_repos",
+    description:
+      "List the owner's GitHub repos with name, private flag, description, topics, fork/archived flags and whether each is currently in the portfolio (topic 'portfolio').",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "add_to_portfolio",
+    description:
+      "Add the topic 'portfolio' to a repo so it shows on the site. For private repos, first ask the user to confirm, then call again with confirm_private=true.",
+    input_schema: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "Repo name only, e.g. my-bot" },
+        confirm_private: { type: "boolean" },
+      },
+      required: ["repo"],
+    },
+  },
+  {
+    name: "remove_from_portfolio",
+    description: "Remove the topic 'portfolio' from a repo so it no longer shows on the site.",
+    input_schema: {
+      type: "object",
+      properties: { repo: { type: "string" } },
+      required: ["repo"],
+    },
+  },
+  {
+    name: "set_description",
+    description: "Set the GitHub description of a repo (shown on the site). Write it in English.",
+    input_schema: {
+      type: "object",
+      properties: { repo: { type: "string" }, description: { type: "string" } },
+      required: ["repo", "description"],
+    },
+  },
 ];
 
-const SYSTEM = `You are the SahadatLabs portfolio assistant. You manage which GitHub repos appear on the owner's public portfolio site.
-Rules:
-- Use list_repos first if you are unsure of an exact repo name.
-- Before adding a PRIVATE repo, warn that its name and description become public and ask for confirmation. Only add it after the user says yes.
-- Write descriptions in clear, short English.
-- Never reveal tokens or secrets. Reply briefly. The user may write in Bengali; reply in the user's language.`;
+const SYSTEM = `You are the dashboard assistant for Sahadat's portfolio site "SahadatLabs".
+You manage which GitHub repos appear on the site, using tools.
+- A repo is on the site when it has the GitHub topic "portfolio".
+- Before adding a PRIVATE repo, tell the user it will show its name and description publicly and ask for confirmation. Only then call add_to_portfolio with confirm_private=true.
+- Repo names and descriptions on the site must be in English.
+- Reply in the same language the user writes in (usually Bengali). Keep replies short, plain text, no markdown tables.
+- Never guess repo names: call list_repos if unsure.
+- After a change, say briefly what changed and whether the site refresh started.`;
 
-// ---------- chat loop ----------
+function cleanName(s) {
+  const n = String(s || "").trim();
+  if (!/^[A-Za-z0-9._-]{1,100}$/.test(n)) throw new Error("Invalid repo name");
+  return n;
+}
+
+async function runTool(env, name, input, state) {
+  const owner = env.GH_OWNER;
+  if (name === "list_repos") {
+    const repos = await gh(env, `/user/repos?per_page=100&affiliation=owner&sort=updated`);
+    return repos
+      .filter((r) => r.owner.login === owner)
+      .map((r) => ({
+        name: r.name,
+        private: r.private,
+        description: r.description,
+        fork: r.fork,
+        archived: r.archived,
+        in_portfolio: (r.topics || []).includes("portfolio"),
+      }));
+  }
+
+  const repoName = cleanName(input.repo);
+  const repo = await gh(env, `/repos/${owner}/${repoName}`);
+  const topics = repo.topics || [];
+
+  if (name === "add_to_portfolio") {
+    if (repo.fork || repo.archived) {
+      return { error: "Forks and archived repos are not shown on the site." };
+    }
+    if (repo.private && !input.confirm_private) {
+      return { needs_confirmation: true, message: "This repo is private. Ask the user to confirm." };
+    }
+    if (topics.includes("portfolio")) return { ok: true, note: "Already in portfolio." };
+    await gh(env, `/repos/${owner}/${repoName}/topics`, {
+      method: "PUT",
+      body: JSON.stringify({ names: [...topics, "portfolio"] }),
+    });
+    state.changed = true;
+    return { ok: true, added: repoName };
+  }
+
+  if (name === "remove_from_portfolio") {
+    if (!topics.includes("portfolio")) return { ok: true, note: "Was not in portfolio." };
+    await gh(env, `/repos/${owner}/${repoName}/topics`, {
+      method: "PUT",
+      body: JSON.stringify({ names: topics.filter((t) => t !== "portfolio") }),
+    });
+    state.changed = true;
+    return { ok: true, removed: repoName };
+  }
+
+  if (name === "set_description") {
+    const description = String(input.description || "").slice(0, 300);
+    await gh(env, `/repos/${owner}/${repoName}`, {
+      method: "PATCH",
+      body: JSON.stringify({ description }),
+    });
+    state.changed = true;
+    return { ok: true, repo: repoName, description };
+  }
+
+  return { error: "Unknown tool" };
+}
+
 async function chat(env, messages) {
-  for (let round = 0; round < 6; round++) {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const state = { changed: false };
+  let convo = messages;
+
+  for (let step = 0; step < 6; step++) {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "x-api-key": env.ANTHROPIC_API_KEY,
@@ -124,56 +222,97 @@ async function chat(env, messages) {
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6", max_tokens: 1000,
-        system: SYSTEM, tools: toolDefs, messages,
+        model: MODEL,
+        max_tokens: 1024,
+        system: SYSTEM,
+        tools: TOOLS,
+        messages: convo,
       }),
     });
-    if (!res.ok) throw new Error("Anthropic " + res.status);
-    const data = await res.json();
-    messages.push({ role: "assistant", content: data.content });
-    const calls = data.content.filter((b) => b.type === "tool_use");
-    if (!calls.length) {
-      return data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+    const data = await r.json();
+    if (!r.ok) throw new Error((data.error && data.error.message) || "Claude API error");
+
+    if (data.stop_reason !== "tool_use") {
+      return data.content
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim();
     }
+
+    convo = [...convo, { role: "assistant", content: data.content }];
     const results = [];
-    for (const c of calls) {
-      let out, isErr = false;
-      try { out = await tools[c.name](env, c.input || {}); }
-      catch (e) { out = String(e.message || e); isErr = true; }
-      results.push({ type: "tool_result", tool_use_id: c.id, is_error: isErr, content: JSON.stringify(out) });
+    for (const block of data.content) {
+      if (block.type !== "tool_use") continue;
+      let out;
+      try {
+        out = await runTool(env, block.name, block.input || {}, state);
+        if (state.changed && !state.dispatched && block.name !== "list_repos") {
+          state.dispatched = true;
+          out = { ...out, site: await triggerSiteUpdate(env) };
+        }
+      } catch (e) {
+        out = { error: e.message };
+      }
+      results.push({
+        type: "tool_result",
+        tool_use_id: block.id,
+        content: JSON.stringify(out),
+      });
     }
-    messages.push({ role: "user", content: results });
+    convo = [...convo, { role: "user", content: results }];
   }
-  return "Too many steps. Please try a simpler request.";
+  return "Too many steps. Please try a simpler command.";
 }
 
-// ---------- routes ----------
 export default {
-  async fetch(request, env) {
-    if (request.method === "OPTIONS") return new Response(null, { headers: cors(env) });
-    if (request.method !== "POST") return json(env, { error: "Not found" }, 404);
-    const path = new URL(request.url).pathname;
-    let body;
-    try { body = await request.json(); } catch { return json(env, { error: "Bad request" }, 400); }
+  async fetch(req, env) {
+    const url = new URL(req.url);
 
-    if (path === "/login") {
-      const ok = typeof body.password === "string" &&
-        safeEqual(await hmac("pw", body.password), await hmac("pw", env.ASSISTANT_PASSWORD));
-      if (!ok) { await new Promise((r) => setTimeout(r, 1500)); return json(env, { error: "Wrong password" }, 401); }
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: cors(env) });
+    }
+    if (req.method !== "POST") return json(env, { error: "Not found" }, 404);
+
+    const origin = req.headers.get("Origin");
+    if (origin && origin !== env.ALLOWED_ORIGIN) {
+      return json(env, { error: "Forbidden" }, 403);
+    }
+
+    if (url.pathname === "/login") {
+      let body = {};
+      try {
+        body = await req.json();
+      } catch {}
+      const a = await hmac(env.SESSION_SECRET, String(body.password || ""));
+      const b = await hmac(env.SESSION_SECRET, env.ASSISTANT_PASSWORD);
+      if (!safeEq(a, b)) {
+        await new Promise((r) => setTimeout(r, 600));
+        return json(env, { error: "Wrong password" }, 401);
+      }
       return json(env, { token: await makeToken(env) });
     }
 
-    if (path === "/chat") {
-      const token = (request.headers.get("Authorization") || "").replace("Bearer ", "");
-      if (!(await validToken(env, token))) return json(env, { error: "Locked" }, 401);
-      if (!Array.isArray(body.messages)) return json(env, { error: "Bad request" }, 400);
-      // keep only plain text turns from the browser; tool calls stay server-side
-      const messages = body.messages.slice(-20).map((m) => ({
-        role: m.role === "assistant" ? "assistant" : "user", content: String(m.content).slice(0, 2000),
-      }));
-      try { return json(env, { reply: await chat(env, messages) }); }
-      catch (e) { return json(env, { error: "Assistant error" }, 500); }
+    if (url.pathname === "/chat") {
+      if (!(await checkToken(env, req))) return json(env, { error: "Session expired" }, 401);
+      let body = {};
+      try {
+        body = await req.json();
+      } catch {}
+      const messages = (Array.isArray(body.messages) ? body.messages : [])
+        .slice(-20)
+        .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+        .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }));
+      if (!messages.length || messages[0].role !== "user") {
+        return json(env, { error: "Bad request" }, 400);
+      }
+      try {
+        return json(env, { reply: await chat(env, messages) });
+      } catch (e) {
+        return json(env, { error: e.message }, 500);
+      }
     }
+
     return json(env, { error: "Not found" }, 404);
   },
 };
