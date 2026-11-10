@@ -504,22 +504,29 @@ async function callGemini(env, payload) {
   const models = [env.GEMINI_MODEL || DEFAULT_MODEL, env.GEMINI_FALLBACK_MODEL || FALLBACK_MODEL];
   let lastErr = "Gemini API error";
   for (const model of models) {
-    let withThinking = true; // ask for fast, low-effort thinking; drop it if the model rejects it
-    for (let attempt = 0; attempt < 3; attempt++) {
+    let withThinking = true; // fast thinking; dropped if the model rejects it
+    for (let attempt = 0; attempt < 2; attempt++) {
       const body = withThinking
-        ? { ...payload, generationConfig: { thinkingConfig: { thinkingLevel: "low" } } }
+        ? { ...payload, generationConfig: { thinkingConfig: { thinkingLevel: "minimal" } } }
         : payload;
-      const r = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-        {
-          method: "POST",
-          headers: {
-            "x-goog-api-key": env.GEMINI_API_KEY,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(body),
-        }
-      );
+      let r;
+      try {
+        r = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+          {
+            method: "POST",
+            headers: {
+              "x-goog-api-key": env.GEMINI_API_KEY,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(12000),
+          }
+        );
+      } catch (e) {
+        lastErr = "The AI took too long to answer.";
+        break; // try the next model
+      }
       let data = {};
       try {
         data = await r.json();
@@ -533,13 +540,68 @@ async function callGemini(env, payload) {
       }
       if (r.status === 404 || r.status === 400) break;
       if (r.status === 429 || r.status >= 500) {
-        await new Promise((res) => setTimeout(res, 700 * (attempt + 1)));
+        if (attempt === 0) await new Promise((res) => setTimeout(res, 500));
         continue;
       }
       throw new Error(lastErr);
     }
   }
   throw new Error(lastErr);
+}
+
+const NAME = "([A-Za-z0-9._-]+)";
+const Q = "[\"\u201c\u2018']?";
+const QE = "[\"\u201d\u2019']?";
+
+async function fastPath(env, text) {
+  const t = String(text || "").trim();
+  let m;
+  const state = { changed: false };
+  const done = async (msg) => {
+    if (state.changed) msg += "\n" + (await triggerSiteUpdate(env));
+    return msg;
+  };
+  const addMsg = (out, repo) => {
+    if (out.needs_confirmation)
+      return `${repo} is private. Its name and description will be public on the site.\nTo continue send: confirm add ${repo}`;
+    if (out.error) return "Could not add: " + out.error;
+    return out.note
+      ? `${repo}: ${out.note}${out.display_name ? ' Name: "' + out.display_name + '"' : ""}`
+      : `Added ${repo} to the portfolio.${out.display_name ? ' Name: "' + out.display_name + '"' : ""}`;
+  };
+  try {
+    if ((m = t.match(new RegExp(`^confirm add ${NAME}(?: as (.+))?$`, "i")))) {
+      const out = await runTool(env, "add_to_portfolio", { repo: m[1], confirm_private: true, display_name: m[2] }, state);
+      return done(addMsg(out, m[1]));
+    }
+    if (
+      (m = t.match(
+        new RegExp(`^add\\s+${NAME}(?:\\s+to\\s+(?:the\\s+)?portfolio)?(?:\\s*,?\\s*(?:name it|named|as)\\s+${Q}(.+?)${QE})?\\s*$`, "i")
+      ))
+    ) {
+      const out = await runTool(env, "add_to_portfolio", { repo: m[1], display_name: m[2] }, state);
+      return done(addMsg(out, m[1]));
+    }
+    if ((m = t.match(new RegExp(`^remove\\s+${NAME}(?:\\s+from\\s+(?:the\\s+)?portfolio)?\\s*$`, "i")))) {
+      const out = await runTool(env, "remove_from_portfolio", { repo: m[1] }, state);
+      return done(out.error ? "Could not remove: " + out.error : `Removed ${m[1]} from the portfolio.`);
+    }
+    if ((m = t.match(new RegExp(`^(un)?feature\\s+${NAME}\\s*$`, "i")))) {
+      const out = await runTool(env, "set_featured", { repo: m[2], featured: !m[1] }, state);
+      return done(out.error ? "Could not change: " + out.error : `${m[2]} is now ${m[1] ? "not featured" : "featured"}. ${out.note || ""}`.trim());
+    }
+    if ((m = t.match(new RegExp(`^rename\\s+${NAME}\\s+to\\s+${Q}(.+?)${QE}\\s*$`, "i")))) {
+      const out = await runTool(env, "set_display_name", { repo: m[1], title: m[2] }, state);
+      return done(out.error ? "Could not rename: " + out.error : `${m[1]} will show as "${m[2]}" on the site.`);
+    }
+    if ((m = t.match(new RegExp(`^reset name of ${NAME}\\s*$`, "i")))) {
+      const out = await runTool(env, "set_display_name", { repo: m[1], title: "" }, state);
+      return done(out.error ? "Could not reset: " + out.error : `${m[1]} will show its repo name again.`);
+    }
+  } catch (e) {
+    return "Error: " + e.message;
+  }
+  return null;
 }
 
 async function chat(env, messages) {
@@ -674,6 +736,8 @@ export default {
         return json(env, { error: "Bad request" }, 400);
       }
       try {
+        const quick = await fastPath(env, messages[messages.length - 1].content);
+        if (quick !== null) return json(env, { reply: quick });
         return json(env, { reply: await chat(env, messages) });
       } catch (e) {
         return json(env, { error: e.message }, 500);
