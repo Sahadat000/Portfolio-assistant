@@ -3,6 +3,7 @@
 // Vars: GH_OWNER, SITE_REPO, ALLOWED_ORIGIN, GEMINI_MODEL (optional)
 
 const DEFAULT_MODEL = "gemini-3.5-flash";
+const FALLBACK_MODEL = "gemini-3.1-flash-lite";
 const SESSION_MS = 4 * 60 * 60 * 1000;
 const enc = new TextEncoder();
 
@@ -231,32 +232,53 @@ const GEMINI_TOOLS = [
   },
 ];
 
+async function callGemini(env, payload) {
+  const primary = env.GEMINI_MODEL || DEFAULT_MODEL;
+  const models = [primary, env.GEMINI_FALLBACK_MODEL || FALLBACK_MODEL];
+  let lastErr = "Gemini API error";
+  for (const model of models) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "x-goog-api-key": env.GEMINI_API_KEY,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        }
+      );
+      let data = {};
+      try {
+        data = await r.json();
+      } catch {}
+      if (r.ok) return data;
+      lastErr = (data.error && data.error.message) || "Gemini API error (" + r.status + ")";
+      if (r.status === 404 || r.status === 400) break; // bad model name: try next model
+      if (r.status === 429 || r.status >= 500) {
+        await new Promise((res) => setTimeout(res, 1200 * (attempt + 1)));
+        continue;
+      }
+      throw new Error(lastErr);
+    }
+  }
+  throw new Error(lastErr);
+}
+
 async function chat(env, messages) {
   const state = { changed: false, dispatched: false };
-  const model = env.GEMINI_MODEL || DEFAULT_MODEL;
   const contents = messages.map((m) => ({
     role: m.role === "assistant" ? "model" : "user",
     parts: [{ text: m.content }],
   }));
 
   for (let step = 0; step < 6; step++) {
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "x-goog-api-key": env.GEMINI_API_KEY,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM }] },
-          contents,
-          tools: GEMINI_TOOLS,
-        }),
-      }
-    );
-    const data = await r.json();
-    if (!r.ok) throw new Error((data.error && data.error.message) || "Gemini API error");
+    const data = await callGemini(env, {
+      systemInstruction: { parts: [{ text: SYSTEM }] },
+      contents,
+      tools: GEMINI_TOOLS,
+    });
 
     const cand = data.candidates && data.candidates[0];
     const parts = (cand && cand.content && cand.content.parts) || [];
