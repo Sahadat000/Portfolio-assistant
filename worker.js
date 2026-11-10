@@ -136,12 +136,41 @@ const TOOLS = [
     },
   },
   {
+    name: "search_icons",
+    description: "Search the free online Iconify library for icons by English keyword (e.g. robot, rocket, headset). Returns icon ids like mdi:robot-happy. Use before set_icon_from_library.",
+    input_schema: {
+      type: "object",
+      properties: { query: { type: "string", description: "English search word" } },
+      required: ["query"],
+    },
+  },
+  {
+    name: "set_icon_from_library",
+    description: "Use an icon from the online Iconify library as the floating assistant button on the dashboard. icon is an id from search_icons, like mdi:robot-happy.",
+    input_schema: {
+      type: "object",
+      properties: { icon: { type: "string", description: "Icon id such as mdi:robot-happy" } },
+      required: ["icon"],
+    },
+  },
+  {
+    name: "search_icons",
+    description: "Search the open Iconify library online for icons by keyword (English). Returns icon ids like lucide:bot. Use it before set_assistant_icon with icon_id.",
+    input_schema: {
+      type: "object",
+      properties: { query: { type: "string", description: "English keyword, e.g. robot, rocket, brain" } },
+      required: ["query"],
+    },
+  },
+  {
     name: "set_assistant_icon",
-    description: "Change the look of the floating assistant button on the dashboard. icon is one of: robot, sparkle, chat, rocket, bolt. color is an optional hex color like #e09f3e. At least one must be given.",
+    description:
+      "Change the floating assistant button on the dashboard. Either icon (built-in: robot, sparkle, chat, rocket, bolt) or icon_id (an id from search_icons, like lucide:bot), and optionally color as a hex code like #e09f3e.",
     input_schema: {
       type: "object",
       properties: {
         icon: { type: "string", description: "robot, sparkle, chat, rocket or bolt" },
+        icon_id: { type: "string", description: "Iconify id from search_icons, e.g. lucide:bot" },
         color: { type: "string", description: "Hex color such as #e09f3e" },
       },
     },
@@ -201,7 +230,8 @@ You manage which GitHub repos appear on the site, using tools.
 - After a change, say briefly what changed and whether the site refresh started.
 - For About changes: if the user speaks in Bengali, write a polished English first-person text, save it with set_about, then show the saved text.
 - The site can show a display name different from the repo name. If the user gives a name for a project, pass it as display_name when adding, or use set_display_name. Display names must be in English; polish them if the user speaks Bengali.
-- The floating assistant button on the dashboard can change icon (robot, sparkle, chat, rocket, bolt) and color; use set_assistant_icon. Convert color names to hex codes.
+- The floating assistant button on the dashboard can change icon (robot, sparkle, chat, rocket, bolt) and color; use set_assistant_icon. Convert color names to hex codes. For any other icon the user asks for, call search_icons with an English keyword, pick the best match, then set_assistant_icon with icon_id.
+- To use an icon found online: call search_icons with an English keyword, pick the best id, then call set_icon_from_library. Tell the user which icon you picked.
 - To feature a project (show it first with a star) use set_featured.
 - For site status or visitor questions, use site_status and site_views and summarize in a few short lines.`;
 
@@ -277,15 +307,50 @@ async function setDisplayName(env, repo, title) {
   }
 }
 
-async function setAssistantLook(env, icon, color) {
-  const ICONS = ["robot", "sparkle", "chat", "rocket", "bolt"];
-  if (icon && !ICONS.includes(icon)) throw new Error("Icon must be one of: " + ICONS.join(", "));
+function safeSvg(t) {
+  return (
+    typeof t === "string" &&
+    t.startsWith("<svg") &&
+    t.length < 12000 &&
+    !/<script|<foreignObject|<image|<style|\son[a-z]+\s*=|javascript:|href\s*=|<!ENTITY/i.test(t)
+  );
+}
+
+async function searchIcons(query) {
+  const q = String(query || "").trim().slice(0, 40);
+  if (!q) throw new Error("Empty search");
+  const r = await fetch(
+    "https://api.iconify.design/search?limit=14&prefixes=lucide,tabler,mdi,ph&query=" + encodeURIComponent(q)
+  );
+  if (!r.ok) throw new Error("Icon search failed (" + r.status + ")");
+  const d = await r.json();
+  return d.icons || [];
+}
+
+async function setAssistantLook(env, icon, color, iconId) {
+  const PRESETS = ["robot", "sparkle", "chat", "rocket", "bolt"];
+  if (icon && !PRESETS.includes(icon)) throw new Error("Icon must be one of: " + PRESETS.join(", "));
   if (color && !/^#[0-9a-fA-F]{6}$/.test(color)) throw new Error("Color must be a hex code like #e09f3e");
-  if (!icon && !color) throw new Error("Give an icon or a color");
+  let svg = null;
+  if (iconId) {
+    if (!/^[a-z0-9-]+:[a-z0-9-]+$/.test(iconId)) throw new Error("Bad icon id");
+    const [prefix, nm] = iconId.split(":");
+    const r = await fetch(`https://api.iconify.design/${prefix}/${nm}.svg`);
+    if (!r.ok) throw new Error("Icon not found: " + iconId);
+    svg = (await r.text()).trim();
+    if (!safeSvg(svg)) throw new Error("Icon was rejected as unsafe or too large");
+  }
+  if (!icon && !color && !svg) throw new Error("Give an icon, an icon_id or a color");
   for (let attempt = 0; attempt < 3; attempt++) {
     const { sha, data } = await readData(env);
     data.profile = data.profile || {};
-    if (icon) data.profile.assistant_icon = icon;
+    if (svg) {
+      data.profile.assistant_icon = "custom";
+      data.profile.assistant_icon_svg = svg;
+    } else if (icon) {
+      data.profile.assistant_icon = icon;
+      delete data.profile.assistant_icon_svg;
+    }
     if (color) data.profile.assistant_color = color;
     try {
       await gh(env, `/repos/${env.GH_OWNER}/${env.SITE_REPO}/contents/data.json`, {
@@ -296,7 +361,10 @@ async function setAssistantLook(env, icon, color) {
           sha,
         }),
       });
-      return { icon: data.profile.assistant_icon || "robot", color: data.profile.assistant_color || "default" };
+      return {
+        icon: iconId || data.profile.assistant_icon || "robot",
+        color: data.profile.assistant_color || "default",
+      };
     } catch (e) {
       if (!String(e.message).startsWith("409") || attempt === 2) throw e;
     }
@@ -340,8 +408,27 @@ async function runTool(env, name, input, state) {
     };
   }
 
+  if (name === "search_icons") {
+    const q = String(input.query || "").trim().slice(0, 40);
+    if (!q) return { error: "Empty search" };
+    const r = await fetch(
+      `https://api.iconify.design/search?query=${encodeURIComponent(q)}&limit=12&prefixes=mdi,lucide,tabler,ph,bi`
+    );
+    if (!r.ok) return { error: "Icon service error " + r.status };
+    const j = await r.json();
+    return { icons: j.icons || [] };
+  }
+
+  if (name === "set_icon_from_library") {
+    return { ok: true, icon: await setIconFromLibrary(env, input.icon) };
+  }
+
+  if (name === "search_icons") {
+    return { icons: await searchIcons(input.query) };
+  }
+
   if (name === "set_assistant_icon") {
-    return { ok: true, ...(await setAssistantLook(env, input.icon, input.color)) };
+    return { ok: true, ...(await setAssistantLook(env, input.icon, input.color, input.icon_id)) };
   }
 
   if (name === "get_about") {
