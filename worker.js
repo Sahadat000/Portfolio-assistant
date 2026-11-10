@@ -112,6 +112,7 @@ const TOOLS = [
       properties: {
         repo: { type: "string", description: "Repo name only, e.g. my-bot" },
         confirm_private: { type: "boolean" },
+        display_name: { type: "string", description: "Optional. The name to show on the site instead of the repo name (English)." },
       },
       required: ["repo"],
     },
@@ -132,6 +133,15 @@ const TOOLS = [
       type: "object",
       properties: { repo: { type: "string" }, description: { type: "string" } },
       required: ["repo", "description"],
+    },
+  },
+  {
+    name: "set_display_name",
+    description: "Set the name shown on the site for a project, different from the repo name. Pass an empty title to go back to the repo name.",
+    input_schema: {
+      type: "object",
+      properties: { repo: { type: "string" }, title: { type: "string", description: "Display name in English, or empty to reset" } },
+      required: ["repo", "title"],
     },
   },
   {
@@ -179,6 +189,7 @@ You manage which GitHub repos appear on the site, using tools.
 - Never guess repo names: call list_repos if unsure.
 - After a change, say briefly what changed and whether the site refresh started.
 - For About changes: if the user speaks in Bengali, write a polished English first-person text, save it with set_about, then show the saved text.
+- The site can show a display name different from the repo name. If the user gives a name for a project, pass it as display_name when adding, or use set_display_name. Display names must be in English; polish them if the user speaks Bengali.
 - To feature a project (show it first with a star) use set_featured.
 - For site status or visitor questions, use site_status and site_views and summarize in a few short lines.`;
 
@@ -220,6 +231,29 @@ async function setAbout(env, text) {
         method: "PUT",
         body: JSON.stringify({
           message: "Update About via assistant",
+          content: textToB64(JSON.stringify(data, null, 2) + "\n"),
+          sha,
+        }),
+      });
+      return clean;
+    } catch (e) {
+      if (!String(e.message).startsWith("409") || attempt === 2) throw e;
+    }
+  }
+}
+
+async function setDisplayName(env, repo, title) {
+  const clean = String(title || "").trim().slice(0, 80);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { sha, data } = await readData(env);
+    data.display_names = data.display_names || {};
+    if (clean) data.display_names[repo] = clean;
+    else delete data.display_names[repo];
+    try {
+      await gh(env, `/repos/${env.GH_OWNER}/${env.SITE_REPO}/contents/data.json`, {
+        method: "PUT",
+        body: JSON.stringify({
+          message: "Set display name via assistant",
           content: textToB64(JSON.stringify(data, null, 2) + "\n"),
           sha,
         }),
@@ -288,13 +322,27 @@ async function runTool(env, name, input, state) {
     if (repo.private && !input.confirm_private) {
       return { needs_confirmation: true, message: "This repo is private. Ask the user to confirm." };
     }
-    if (topics.includes("portfolio")) return { ok: true, note: "Already in portfolio." };
+    if (topics.includes("portfolio")) {
+      if (input.display_name) {
+        const shown = await setDisplayName(env, repoName, input.display_name);
+        return { ok: true, note: "Already in portfolio.", display_name: shown };
+      }
+      return { ok: true, note: "Already in portfolio." };
+    }
     await gh(env, `/repos/${owner}/${repoName}/topics`, {
       method: "PUT",
       body: JSON.stringify({ names: [...topics, "portfolio"] }),
     });
     state.changed = true;
-    return { ok: true, added: repoName };
+    let shownName = "";
+    if (input.display_name) shownName = await setDisplayName(env, repoName, input.display_name);
+    return { ok: true, added: repoName, display_name: shownName };
+  }
+
+  if (name === "set_display_name") {
+    const shown = await setDisplayName(env, repoName, input.title);
+    state.changed = true;
+    return { ok: true, repo: repoName, display_name: shown || "(reset to repo name)" };
   }
 
   if (name === "set_featured") {
