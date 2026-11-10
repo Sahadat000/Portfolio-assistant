@@ -135,6 +135,15 @@ const TOOLS = [
     },
   },
   {
+    name: "set_featured",
+    description: "Mark a repo as featured (shown first on the site, with a star) or remove the featured mark. The repo must also be in the portfolio to appear.",
+    input_schema: {
+      type: "object",
+      properties: { repo: { type: "string" }, featured: { type: "boolean", description: "true to feature, false to unfeature" } },
+      required: ["repo"],
+    },
+  },
+  {
     name: "site_status",
     description: "Show the latest runs of the site update workflow (status, success or failure, time).",
     input_schema: { type: "object", properties: {} },
@@ -170,6 +179,7 @@ You manage which GitHub repos appear on the site, using tools.
 - Never guess repo names: call list_repos if unsure.
 - After a change, say briefly what changed and whether the site refresh started.
 - For About changes: if the user speaks in Bengali, write a polished English first-person text, save it with set_about, then show the saved text.
+- To feature a project (show it first with a star) use set_featured.
 - For site status or visitor questions, use site_status and site_views and summarize in a few short lines.`;
 
 function cleanName(s) {
@@ -234,6 +244,7 @@ async function runTool(env, name, input, state) {
         fork: r.fork,
         archived: r.archived,
         in_portfolio: (r.topics || []).includes("portfolio"),
+        featured: (r.topics || []).includes("featured"),
       }));
   }
 
@@ -286,6 +297,21 @@ async function runTool(env, name, input, state) {
     return { ok: true, added: repoName };
   }
 
+  if (name === "set_featured") {
+    const want = input.featured !== false;
+    const has = topics.includes("featured");
+    if (want === has) return { ok: true, note: "No change needed." };
+    const names = want ? [...topics, "featured"] : topics.filter((t) => t !== "featured");
+    await gh(env, `/repos/${owner}/${repoName}/topics`, { method: "PUT", body: JSON.stringify({ names }) });
+    state.changed = true;
+    return {
+      ok: true,
+      repo: repoName,
+      featured: want,
+      note: topics.includes("portfolio") ? "" : "This repo is not in the portfolio yet, so it will not show on the site.",
+    };
+  }
+
   if (name === "remove_from_portfolio") {
     if (!topics.includes("portfolio")) return { ok: true, note: "Was not in portfolio." };
     await gh(env, `/repos/${owner}/${repoName}/topics`, {
@@ -332,11 +358,14 @@ const GEMINI_TOOLS = [
 ];
 
 async function callGemini(env, payload) {
-  const primary = env.GEMINI_MODEL || DEFAULT_MODEL;
-  const models = [primary, env.GEMINI_FALLBACK_MODEL || FALLBACK_MODEL];
+  const models = [env.GEMINI_MODEL || DEFAULT_MODEL, env.GEMINI_FALLBACK_MODEL || FALLBACK_MODEL];
   let lastErr = "Gemini API error";
   for (const model of models) {
+    let withThinking = true; // ask for fast, low-effort thinking; drop it if the model rejects it
     for (let attempt = 0; attempt < 3; attempt++) {
+      const body = withThinking
+        ? { ...payload, generationConfig: { thinkingConfig: { thinkingLevel: "low" } } }
+        : payload;
       const r = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
         {
@@ -345,7 +374,7 @@ async function callGemini(env, payload) {
             "x-goog-api-key": env.GEMINI_API_KEY,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify(payload),
+          body: JSON.stringify(body),
         }
       );
       let data = {};
@@ -354,7 +383,12 @@ async function callGemini(env, payload) {
       } catch {}
       if (r.ok) return data;
       lastErr = (data.error && data.error.message) || "Gemini API error (" + r.status + ")";
-      if (r.status === 404 || r.status === 400) break; // bad model name: try next model
+      if (r.status === 400 && withThinking) {
+        withThinking = false;
+        attempt--;
+        continue;
+      }
+      if (r.status === 404 || r.status === 400) break;
       if (r.status === 429 || r.status >= 500) {
         await new Promise((res) => setTimeout(res, 700 * (attempt + 1)));
         continue;
@@ -445,6 +479,42 @@ export default {
         return json(env, { error: "Wrong password" }, 401);
       }
       return json(env, { token: await makeToken(env) });
+    }
+
+    if (url.pathname === "/quick") {
+      if (!(await checkToken(env, req))) return json(env, { error: "Session expired" }, 401);
+      let body = {};
+      try {
+        body = await req.json();
+      } catch {}
+      try {
+        const state = {};
+        if (body.cmd === "repos") {
+          const list = await runTool(env, "list_repos", {}, state);
+          const lines = list.map(
+            (r) =>
+              `${r.in_portfolio ? "\u2705" : "\u2b1c"}${r.featured ? "\u2b50" : ""} ${r.name} (${r.private ? "private" : "public"})`
+          );
+          return json(env, { reply: "On site = \u2705, not on site = \u2b1c, featured = \u2b50\n\n" + lines.join("\n") });
+        }
+        if (body.cmd === "status") {
+          const runs = await runTool(env, "site_status", {}, state);
+          const lines = runs.map(
+            (x) =>
+              `${x.status === "completed" ? x.conclusion : x.status} - ${x.trigger} - ${String(x.updated).replace("T", " ").slice(0, 16)} UTC`
+          );
+          return json(env, { reply: "Latest site updates:\n" + (lines.join("\n") || "No runs yet.") });
+        }
+        if (body.cmd === "views") {
+          const v = await runTool(env, "site_views", {}, state);
+          return json(env, {
+            reply: `Last 14 days:\nViews: ${v.views_last_14_days}\nUnique visitors: ${v.unique_visitors_last_14_days}`,
+          });
+        }
+        return json(env, { error: "Unknown command" }, 400);
+      } catch (e) {
+        return json(env, { error: e.message }, 500);
+      }
     }
 
     if (url.pathname === "/chat") {
