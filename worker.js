@@ -136,6 +136,17 @@ const TOOLS = [
     },
   },
   {
+    name: "set_assistant_icon",
+    description: "Change the look of the floating assistant button on the dashboard. icon is one of: robot, sparkle, chat, rocket, bolt. color is an optional hex color like #e09f3e. At least one must be given.",
+    input_schema: {
+      type: "object",
+      properties: {
+        icon: { type: "string", description: "robot, sparkle, chat, rocket or bolt" },
+        color: { type: "string", description: "Hex color such as #e09f3e" },
+      },
+    },
+  },
+  {
     name: "set_display_name",
     description: "Set the name shown on the site for a project, different from the repo name. Pass an empty title to go back to the repo name.",
     input_schema: {
@@ -190,6 +201,7 @@ You manage which GitHub repos appear on the site, using tools.
 - After a change, say briefly what changed and whether the site refresh started.
 - For About changes: if the user speaks in Bengali, write a polished English first-person text, save it with set_about, then show the saved text.
 - The site can show a display name different from the repo name. If the user gives a name for a project, pass it as display_name when adding, or use set_display_name. Display names must be in English; polish them if the user speaks Bengali.
+- The floating assistant button on the dashboard can change icon (robot, sparkle, chat, rocket, bolt) and color; use set_assistant_icon. Convert color names to hex codes.
 - To feature a project (show it first with a star) use set_featured.
 - For site status or visitor questions, use site_status and site_views and summarize in a few short lines.`;
 
@@ -265,6 +277,32 @@ async function setDisplayName(env, repo, title) {
   }
 }
 
+async function setAssistantLook(env, icon, color) {
+  const ICONS = ["robot", "sparkle", "chat", "rocket", "bolt"];
+  if (icon && !ICONS.includes(icon)) throw new Error("Icon must be one of: " + ICONS.join(", "));
+  if (color && !/^#[0-9a-fA-F]{6}$/.test(color)) throw new Error("Color must be a hex code like #e09f3e");
+  if (!icon && !color) throw new Error("Give an icon or a color");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { sha, data } = await readData(env);
+    data.profile = data.profile || {};
+    if (icon) data.profile.assistant_icon = icon;
+    if (color) data.profile.assistant_color = color;
+    try {
+      await gh(env, `/repos/${env.GH_OWNER}/${env.SITE_REPO}/contents/data.json`, {
+        method: "PUT",
+        body: JSON.stringify({
+          message: "Change assistant button via assistant",
+          content: textToB64(JSON.stringify(data, null, 2) + "\n"),
+          sha,
+        }),
+      });
+      return { icon: data.profile.assistant_icon || "robot", color: data.profile.assistant_color || "default" };
+    } catch (e) {
+      if (!String(e.message).startsWith("409") || attempt === 2) throw e;
+    }
+  }
+}
+
 async function runTool(env, name, input, state) {
   const owner = env.GH_OWNER;
   if (name === "list_repos") {
@@ -300,6 +338,10 @@ async function runTool(env, name, input, state) {
       unique_visitors_last_14_days: v.uniques,
       per_day: (v.views || []).map((d) => ({ date: d.timestamp.slice(0, 10), views: d.count, unique: d.uniques })),
     };
+  }
+
+  if (name === "set_assistant_icon") {
+    return { ok: true, ...(await setAssistantLook(env, input.icon, input.color)) };
   }
 
   if (name === "get_about") {
