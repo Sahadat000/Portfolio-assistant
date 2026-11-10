@@ -137,24 +137,6 @@ const TOOLS = [
   },
   {
     name: "search_icons",
-    description: "Search the free online Iconify library for icons by English keyword (e.g. robot, rocket, headset). Returns icon ids like mdi:robot-happy. Use before set_icon_from_library.",
-    input_schema: {
-      type: "object",
-      properties: { query: { type: "string", description: "English search word" } },
-      required: ["query"],
-    },
-  },
-  {
-    name: "set_icon_from_library",
-    description: "Use an icon from the online Iconify library as the floating assistant button on the dashboard. icon is an id from search_icons, like mdi:robot-happy.",
-    input_schema: {
-      type: "object",
-      properties: { icon: { type: "string", description: "Icon id such as mdi:robot-happy" } },
-      required: ["icon"],
-    },
-  },
-  {
-    name: "search_icons",
     description: "Search the open Iconify library online for icons by keyword (English). Returns icon ids like lucide:bot. Use it before set_assistant_icon with icon_id.",
     input_schema: {
       type: "object",
@@ -231,7 +213,6 @@ You manage which GitHub repos appear on the site, using tools.
 - For About changes: if the user speaks in Bengali, write a polished English first-person text, save it with set_about, then show the saved text.
 - The site can show a display name different from the repo name. If the user gives a name for a project, pass it as display_name when adding, or use set_display_name. Display names must be in English; polish them if the user speaks Bengali.
 - The floating assistant button on the dashboard can change icon (robot, sparkle, chat, rocket, bolt) and color; use set_assistant_icon. Convert color names to hex codes. For any other icon the user asks for, call search_icons with an English keyword, pick the best match, then set_assistant_icon with icon_id.
-- To use an icon found online: call search_icons with an English keyword, pick the best id, then call set_icon_from_library. Tell the user which icon you picked.
 - To feature a project (show it first with a star) use set_featured.
 - For site status or visitor questions, use site_status and site_views and summarize in a few short lines.`;
 
@@ -406,21 +387,6 @@ async function runTool(env, name, input, state) {
       unique_visitors_last_14_days: v.uniques,
       per_day: (v.views || []).map((d) => ({ date: d.timestamp.slice(0, 10), views: d.count, unique: d.uniques })),
     };
-  }
-
-  if (name === "search_icons") {
-    const q = String(input.query || "").trim().slice(0, 40);
-    if (!q) return { error: "Empty search" };
-    const r = await fetch(
-      `https://api.iconify.design/search?query=${encodeURIComponent(q)}&limit=12&prefixes=mdi,lucide,tabler,ph,bi`
-    );
-    if (!r.ok) return { error: "Icon service error " + r.status };
-    const j = await r.json();
-    return { icons: j.icons || [] };
-  }
-
-  if (name === "set_icon_from_library") {
-    return { ok: true, icon: await setIconFromLibrary(env, input.icon) };
   }
 
   if (name === "search_icons") {
