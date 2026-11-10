@@ -2,8 +2,8 @@
 // Secrets: ASSISTANT_PASSWORD, SESSION_SECRET, GITHUB_WRITE_TOKEN, GEMINI_API_KEY
 // Vars: GH_OWNER, SITE_REPO, ALLOWED_ORIGIN, GEMINI_MODEL (optional)
 
-const DEFAULT_MODEL = "gemini-3.5-flash";
-const FALLBACK_MODEL = "gemini-3.1-flash-lite";
+const DEFAULT_MODEL = "gemini-3.1-flash-lite";
+const FALLBACK_MODEL = "gemini-3.5-flash";
 const SESSION_MS = 4 * 60 * 60 * 1000;
 const enc = new TextEncoder();
 
@@ -134,6 +134,31 @@ const TOOLS = [
       required: ["repo", "description"],
     },
   },
+  {
+    name: "site_status",
+    description: "Show the latest runs of the site update workflow (status, success or failure, time).",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "site_views",
+    description: "Show visitor stats for the portfolio site repo for the last 14 days (total views, unique visitors, per day).",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "get_about",
+    description: "Read the current About text shown on the site.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "set_about",
+    description:
+      "Replace the About text on the site. Text must be in English, first person, clear and concise (under 700 characters). Always show the saved text to the user afterwards.",
+    input_schema: {
+      type: "object",
+      properties: { text: { type: "string", description: "The new About text in English" } },
+      required: ["text"],
+    },
+  },
 ];
 
 const SYSTEM = `You are the dashboard assistant for Sahadat's portfolio site "SahadatLabs".
@@ -143,12 +168,57 @@ You manage which GitHub repos appear on the site, using tools.
 - Repo names and descriptions on the site must be in English.
 - Reply in the same language the user writes in (usually Bengali). Keep replies short, plain text, no markdown tables.
 - Never guess repo names: call list_repos if unsure.
-- After a change, say briefly what changed and whether the site refresh started.`;
+- After a change, say briefly what changed and whether the site refresh started.
+- For About changes: if the user speaks in Bengali, write a polished English first-person text, save it with set_about, then show the saved text.
+- For site status or visitor questions, use site_status and site_views and summarize in a few short lines.`;
 
 function cleanName(s) {
   const n = String(s || "").trim();
   if (!/^[A-Za-z0-9._-]{1,100}$/.test(n)) throw new Error("Invalid repo name");
   return n;
+}
+
+function b64ToText(b64) {
+  const bin = atob(b64.replace(/\s/g, ""));
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+function textToB64(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+async function readData(env) {
+  const f = await gh(env, `/repos/${env.GH_OWNER}/${env.SITE_REPO}/contents/data.json`);
+  return { sha: f.sha, data: JSON.parse(b64ToText(f.content)) };
+}
+
+async function setAbout(env, text) {
+  const clean = String(text || "").trim().slice(0, 1500);
+  if (!clean) throw new Error("Empty About text");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { sha, data } = await readData(env);
+    data.profile = data.profile || {};
+    data.profile.about = clean;
+    try {
+      await gh(env, `/repos/${env.GH_OWNER}/${env.SITE_REPO}/contents/data.json`, {
+        method: "PUT",
+        body: JSON.stringify({
+          message: "Update About via assistant",
+          content: textToB64(JSON.stringify(data, null, 2) + "\n"),
+          sha,
+        }),
+      });
+      return clean;
+    } catch (e) {
+      if (!String(e.message).startsWith("409") || attempt === 2) throw e;
+    }
+  }
 }
 
 async function runTool(env, name, input, state) {
@@ -165,6 +235,35 @@ async function runTool(env, name, input, state) {
         archived: r.archived,
         in_portfolio: (r.topics || []).includes("portfolio"),
       }));
+  }
+
+  if (name === "site_status") {
+    const r = await gh(env, `/repos/${owner}/${env.SITE_REPO}/actions/workflows/update.yml/runs?per_page=3`);
+    return (r.workflow_runs || []).map((x) => ({
+      status: x.status,
+      conclusion: x.conclusion,
+      trigger: x.event,
+      started: x.created_at,
+      updated: x.updated_at,
+    }));
+  }
+
+  if (name === "site_views") {
+    const v = await gh(env, `/repos/${owner}/${env.SITE_REPO}/traffic/views`);
+    return {
+      views_last_14_days: v.count,
+      unique_visitors_last_14_days: v.uniques,
+      per_day: (v.views || []).map((d) => ({ date: d.timestamp.slice(0, 10), views: d.count, unique: d.uniques })),
+    };
+  }
+
+  if (name === "get_about") {
+    const { data } = await readData(env);
+    return { about: (data.profile && data.profile.about) || "" };
+  }
+
+  if (name === "set_about") {
+    return { ok: true, saved_text: await setAbout(env, input.text) };
   }
 
   const repoName = cleanName(input.repo);
@@ -257,7 +356,7 @@ async function callGemini(env, payload) {
       lastErr = (data.error && data.error.message) || "Gemini API error (" + r.status + ")";
       if (r.status === 404 || r.status === 400) break; // bad model name: try next model
       if (r.status === 429 || r.status >= 500) {
-        await new Promise((res) => setTimeout(res, 1200 * (attempt + 1)));
+        await new Promise((res) => setTimeout(res, 700 * (attempt + 1)));
         continue;
       }
       throw new Error(lastErr);
@@ -330,6 +429,11 @@ export default {
     }
 
     if (url.pathname === "/login") {
+      if (env.LOGIN_LIMITER) {
+        const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+        const { success } = await env.LOGIN_LIMITER.limit({ key: ip });
+        if (!success) return json(env, { error: "Too many attempts. Wait a minute." }, 429);
+      }
       let body = {};
       try {
         body = await req.json();
