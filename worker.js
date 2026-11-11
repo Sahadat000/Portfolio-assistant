@@ -658,6 +658,16 @@ async function fastPath(env, text) {
       const out = await runTool(env, "set_display_name", { repo: m[1], title: "" }, state);
       return done(out.error ? "Could not reset: " + out.error : `${m[1]} will show its repo name again.`);
     }
+    if ((m = t.match(/^icons\s+(?!robot$|sparkle$|chat$|rocket$|bolt$)(.+)$/i))) {
+      const ids = await searchIcons(m[1]);
+      return ids.length
+        ? "Icons found. To use one, send: icon <name>\n\n" + ids.join("\n")
+        : "No icons found. Try another English word.";
+    }
+    if ((m = t.match(/^icon\s+([a-z0-9-]+:[a-z0-9-]+)\s*$/i))) {
+      await setAssistantLook(env, null, null, m[1].toLowerCase());
+      return `Button icon set to ${m[1].toLowerCase()}.`;
+    }
     if (/^(my repos|repos|list repos|show (my )?repos)$/i.test(t)) return await quickText(env, "repos");
     if (/^test ai$/i.test(t)) return await testAi(env);
     if (/^(status|site status)$/i.test(t)) return await quickText(env, "status");
