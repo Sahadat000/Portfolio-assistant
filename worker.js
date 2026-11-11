@@ -749,34 +749,48 @@ async function chatCompat(env, cfg, messages) {
   return "Too many steps. Please try a simpler command.";
 }
 
-async function chat(env, messages) {
-  const providers = [];
+async function chat(env, messages, pref) {
+  const list = [];
   if (env.GROQ_API_KEY) {
-    providers.push(() =>
-      chatCompat(env, {
-        name: "Groq",
-        url: "https://api.groq.com/openai/v1/chat/completions",
-        key: env.GROQ_API_KEY,
-        model: env.GROQ_MODEL || "llama-3.3-70b-versatile",
-      }, messages)
-    );
+    list.push({
+      id: "groq",
+      label: "Groq",
+      run: () =>
+        chatCompat(env, {
+          name: "Groq",
+          url: "https://api.groq.com/openai/v1/chat/completions",
+          key: env.GROQ_API_KEY,
+          model: env.GROQ_MODEL || "llama-3.3-70b-versatile",
+        }, messages),
+    });
   }
   if (env.OPENAI_API_KEY) {
-    providers.push(() =>
-      chatCompat(env, {
-        name: "OpenAI",
-        url: "https://api.openai.com/v1/chat/completions",
-        key: env.OPENAI_API_KEY,
-        model: env.OPENAI_MODEL || "gpt-4o-mini",
-      }, messages)
-    );
+    list.push({
+      id: "openai",
+      label: "OpenAI",
+      run: () =>
+        chatCompat(env, {
+          name: "OpenAI",
+          url: "https://api.openai.com/v1/chat/completions",
+          key: env.OPENAI_API_KEY,
+          model: env.OPENAI_MODEL || "gpt-4o-mini",
+        }, messages),
+    });
   }
-  if (env.GEMINI_API_KEY) providers.push(() => chatGemini(env, messages));
+  if (env.GEMINI_API_KEY) {
+    list.push({ id: "gemini", label: "Gemini", run: () => chatGemini(env, messages) });
+  }
+
+  // The chosen AI goes first; the others are automatic backups when it fails or hits its limit.
+  const want = String(pref || "auto").toLowerCase();
+  const first = list.findIndex((p) => p.id === want);
+  const ordered = first > 0 ? [list[first], ...list.filter((_, i) => i !== first)] : list;
 
   let lastErr = new Error("No AI key is set.");
-  for (const run of providers) {
+  for (let i = 0; i < ordered.length; i++) {
     try {
-      return await run();
+      const reply = await ordered[i].run();
+      return { reply, provider: ordered[i].label, switched: i > 0 };
     } catch (e) {
       lastErr = e;
     }
@@ -869,7 +883,7 @@ export default {
       try {
         const quick = await fastPath(env, messages[messages.length - 1].content);
         if (quick !== null) return json(env, { reply: quick });
-        return json(env, { reply: await chat(env, messages) });
+        return json(env, await chat(env, messages, body.provider));
       } catch (e) {
         return json(env, { error: e.message }, 500);
       }
