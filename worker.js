@@ -1,5 +1,5 @@
 // SahadatLabs assistant backend (Cloudflare Worker)
-// Secrets: ASSISTANT_PASSWORD, SESSION_SECRET, GITHUB_WRITE_TOKEN, GEMINI_API_KEY
+// Secrets: ASSISTANT_PASSWORD, SESSION_SECRET, GITHUB_WRITE_TOKEN, and at least one of GROQ_API_KEY (fastest, free), OPENAI_API_KEY, GEMINI_API_KEY
 // Vars: GH_OWNER, SITE_REPO, ALLOWED_ORIGIN, GEMINI_MODEL (optional)
 
 const DEFAULT_MODEL = "gemini-3.1-flash-lite";
@@ -549,6 +549,26 @@ async function callGemini(env, payload) {
   throw new Error(lastErr);
 }
 
+async function quickText(env, cmd) {
+  const state = {};
+  if (cmd === "repos") {
+    const list = await runTool(env, "list_repos", {}, state);
+    const lines = list.map(
+      (r) => `${r.in_portfolio ? "\u2705" : "\u2b1c"}${r.featured ? "\u2b50" : ""} ${r.name} (${r.private ? "private" : "public"})`
+    );
+    return "On site = \u2705, not on site = \u2b1c, featured = \u2b50\n\n" + lines.join("\n");
+  }
+  if (cmd === "status") {
+    const runs = await runTool(env, "site_status", {}, state);
+    const lines = runs.map(
+      (x) => `${x.status === "completed" ? x.conclusion : x.status} - ${x.trigger} - ${String(x.updated).replace("T", " ").slice(0, 16)} UTC`
+    );
+    return "Latest site updates:\n" + (lines.join("\n") || "No runs yet.");
+  }
+  const v = await runTool(env, "site_views", {}, state);
+  return `Last 14 days:\nViews: ${v.views_last_14_days}\nUnique visitors: ${v.unique_visitors_last_14_days}`;
+}
+
 const NAME = "([A-Za-z0-9._-]+)";
 const Q = "[\"\u201c\u2018']?";
 const QE = "[\"\u201d\u2019']?";
@@ -598,13 +618,28 @@ async function fastPath(env, text) {
       const out = await runTool(env, "set_display_name", { repo: m[1], title: "" }, state);
       return done(out.error ? "Could not reset: " + out.error : `${m[1]} will show its repo name again.`);
     }
+    if (/^(my repos|repos|list repos|show (my )?repos)$/i.test(t)) return await quickText(env, "repos");
+    if (/^(status|site status)$/i.test(t)) return await quickText(env, "status");
+    if (/^(views|visitors|visitor count)$/i.test(t)) return await quickText(env, "views");
+    if ((m = t.match(/^icon\s+(robot|sparkle|chat|rocket|bolt)\s*$/i))) {
+      await setAssistantLook(env, m[1].toLowerCase(), null, null);
+      return `Button icon set to ${m[1].toLowerCase()}.`;
+    }
+    if ((m = t.match(/^color\s+(#[0-9a-fA-F]{6})\s*$/i))) {
+      await setAssistantLook(env, null, m[1], null);
+      return `Button color set to ${m[1]}.`;
+    }
+    if ((m = t.match(/^about:\s*([\s\S]+)$/i))) {
+      const saved = await setAbout(env, m[1]);
+      return "About saved:\n" + saved;
+    }
   } catch (e) {
     return "Error: " + e.message;
   }
   return null;
 }
 
-async function chat(env, messages) {
+async function chatGemini(env, messages) {
   const state = { changed: false, dispatched: false };
   const contents = messages.map((m) => ({
     role: m.role === "assistant" ? "model" : "user",
@@ -651,6 +686,102 @@ async function chat(env, messages) {
     contents.push({ role: "user", parts: responses });
   }
   return "Too many steps. Please try a simpler command.";
+}
+
+async function chatCompat(env, cfg, messages) {
+  const tools = TOOLS.map((t) => ({
+    type: "function",
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: t.input_schema.properties ? t.input_schema : { type: "object", properties: {} },
+    },
+  }));
+  const state = { changed: false, dispatched: false };
+  const convo = [{ role: "system", content: SYSTEM }, ...messages];
+
+  for (let step = 0; step < 6; step++) {
+    let r;
+    try {
+      r = await fetch(cfg.url, {
+        method: "POST",
+        headers: { Authorization: "Bearer " + cfg.key, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: cfg.model,
+          messages: convo,
+          tools,
+          tool_choice: "auto",
+          temperature: 0.2,
+          max_tokens: 700,
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+    } catch (e) {
+      throw new Error(cfg.name + " took too long");
+    }
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(cfg.name + ": " + ((data.error && data.error.message) || r.status));
+
+    const msg = data.choices && data.choices[0] && data.choices[0].message;
+    if (!msg) throw new Error(cfg.name + ": empty reply");
+    const calls = msg.tool_calls || [];
+    if (!calls.length) return (msg.content || "").trim() || "No reply. Please try again.";
+
+    convo.push({ role: "assistant", content: msg.content || "", tool_calls: calls });
+    for (const c of calls) {
+      let args = {};
+      try {
+        args = JSON.parse(c.function.arguments || "{}");
+      } catch {}
+      let out;
+      try {
+        out = await runTool(env, c.function.name, args, state);
+        if (state.changed && !state.dispatched && c.function.name !== "list_repos") {
+          state.dispatched = true;
+          out = { ...out, site: await triggerSiteUpdate(env) };
+        }
+      } catch (e) {
+        out = { error: e.message };
+      }
+      convo.push({ role: "tool", tool_call_id: c.id, content: JSON.stringify(out) });
+    }
+  }
+  return "Too many steps. Please try a simpler command.";
+}
+
+async function chat(env, messages) {
+  const providers = [];
+  if (env.GROQ_API_KEY) {
+    providers.push(() =>
+      chatCompat(env, {
+        name: "Groq",
+        url: "https://api.groq.com/openai/v1/chat/completions",
+        key: env.GROQ_API_KEY,
+        model: env.GROQ_MODEL || "llama-3.3-70b-versatile",
+      }, messages)
+    );
+  }
+  if (env.OPENAI_API_KEY) {
+    providers.push(() =>
+      chatCompat(env, {
+        name: "OpenAI",
+        url: "https://api.openai.com/v1/chat/completions",
+        key: env.OPENAI_API_KEY,
+        model: env.OPENAI_MODEL || "gpt-4o-mini",
+      }, messages)
+    );
+  }
+  if (env.GEMINI_API_KEY) providers.push(() => chatGemini(env, messages));
+
+  let lastErr = new Error("No AI key is set.");
+  for (const run of providers) {
+    try {
+      return await run();
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr;
 }
 
 export default {
