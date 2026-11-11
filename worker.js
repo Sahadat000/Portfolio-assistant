@@ -500,7 +500,7 @@ const GEMINI_TOOLS = [
   },
 ];
 
-async function callGemini(env, payload) {
+async function callGemini(env, payload, key) {
   const models = [env.GEMINI_MODEL || DEFAULT_MODEL, env.GEMINI_FALLBACK_MODEL || FALLBACK_MODEL];
   let lastErr = "Gemini API error";
   for (const model of models) {
@@ -516,7 +516,7 @@ async function callGemini(env, payload) {
           {
             method: "POST",
             headers: {
-              "x-goog-api-key": env.GEMINI_API_KEY,
+              "x-goog-api-key": key || env.GEMINI_API_KEY,
               "Content-Type": "application/json",
             },
             body: JSON.stringify(body),
@@ -569,6 +569,41 @@ async function quickText(env, cmd) {
   return `Last 14 days:\nViews: ${v.views_last_14_days}\nUnique visitors: ${v.unique_visitors_last_14_days}`;
 }
 
+async function testAi(env) {
+  const lines = [];
+  const ping = async (label, fn) => {
+    const t0 = Date.now();
+    try {
+      await fn();
+      lines.push(`${label}: OK (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+    } catch (e) {
+      lines.push(`${label}: FAILED - ${String(e.message).slice(0, 160)}`);
+    }
+  };
+  const compat = (name, url, key, model) => async () => {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: "Reply with: OK" }], max_tokens: 5 }),
+      signal: AbortSignal.timeout(10000),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((d.error && d.error.message) || r.status);
+  };
+  const gem = (key) => async () => {
+    await callGemini(env, { contents: [{ role: "user", parts: [{ text: "Reply with: OK" }] }] }, key);
+  };
+  if (env.GROQ_API_KEY)
+    await ping("Groq", compat("Groq", "https://api.groq.com/openai/v1/chat/completions", env.GROQ_API_KEY, env.GROQ_MODEL || "llama-3.3-70b-versatile"));
+  else lines.push("Groq: no key set");
+  if (env.OPENAI_API_KEY)
+    await ping("OpenAI", compat("OpenAI", "https://api.openai.com/v1/chat/completions", env.OPENAI_API_KEY, env.OPENAI_MODEL || "gpt-4o-mini"));
+  if (env.GEMINI_API_KEY) await ping("Gemini", gem(env.GEMINI_API_KEY));
+  else lines.push("Gemini: no key set");
+  if (env.GEMINI_API_KEY_2) await ping("Gemini 2", gem(env.GEMINI_API_KEY_2));
+  return lines.join("\n");
+}
+
 const NAME = "([A-Za-z0-9._-]+)";
 const Q = "[\"\u201c\u2018']?";
 const QE = "[\"\u201d\u2019']?";
@@ -619,6 +654,7 @@ async function fastPath(env, text) {
       return done(out.error ? "Could not reset: " + out.error : `${m[1]} will show its repo name again.`);
     }
     if (/^(my repos|repos|list repos|show (my )?repos)$/i.test(t)) return await quickText(env, "repos");
+    if (/^test ai$/i.test(t)) return await testAi(env);
     if (/^(status|site status)$/i.test(t)) return await quickText(env, "status");
     if (/^(views|visitors|visitor count)$/i.test(t)) return await quickText(env, "views");
     if ((m = t.match(/^icon\s+(robot|sparkle|chat|rocket|bolt)\s*$/i))) {
@@ -639,7 +675,7 @@ async function fastPath(env, text) {
   return null;
 }
 
-async function chatGemini(env, messages) {
+async function chatGemini(env, messages, key) {
   const state = { changed: false, dispatched: false };
   const contents = messages.map((m) => ({
     role: m.role === "assistant" ? "model" : "user",
@@ -651,7 +687,7 @@ async function chatGemini(env, messages) {
       systemInstruction: { parts: [{ text: SYSTEM }] },
       contents,
       tools: GEMINI_TOOLS,
-    });
+    }, key);
 
     const cand = data.candidates && data.candidates[0];
     const parts = (cand && cand.content && cand.content.parts) || [];
@@ -778,7 +814,10 @@ async function chat(env, messages, pref) {
     });
   }
   if (env.GEMINI_API_KEY) {
-    list.push({ id: "gemini", label: "Gemini", run: () => chatGemini(env, messages) });
+    list.push({ id: "gemini", label: "Gemini", run: () => chatGemini(env, messages, env.GEMINI_API_KEY) });
+  }
+  if (env.GEMINI_API_KEY_2) {
+    list.push({ id: "gemini2", label: "Gemini 2", run: () => chatGemini(env, messages, env.GEMINI_API_KEY_2) });
   }
 
   // The chosen AI goes first; the others are automatic backups when it fails or hits its limit.
@@ -786,16 +825,17 @@ async function chat(env, messages, pref) {
   const first = list.findIndex((p) => p.id === want);
   const ordered = first > 0 ? [list[first], ...list.filter((_, i) => i !== first)] : list;
 
-  let lastErr = new Error("No AI key is set.");
+  if (!ordered.length) throw new Error("No AI key is set.");
+  const notes = [];
   for (let i = 0; i < ordered.length; i++) {
     try {
       const reply = await ordered[i].run();
-      return { reply, provider: ordered[i].label, switched: i > 0 };
+      return { reply, provider: ordered[i].label, switched: i > 0, notes };
     } catch (e) {
-      lastErr = e;
+      notes.push(ordered[i].label + ": " + String(e.message).replace(/^(Groq|OpenAI): /, "").slice(0, 160));
     }
   }
-  throw lastErr;
+  throw new Error(notes.join(" | "));
 }
 
 export default {
