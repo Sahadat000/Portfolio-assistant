@@ -904,6 +904,51 @@ export default {
       return json(env, { token: await makeToken(env) });
     }
 
+    if (url.pathname === "/upload") {
+      if (!(await checkToken(env, req))) return json(env, { error: "Session expired" }, 401);
+      let body = {};
+      try {
+        body = await req.json();
+      } catch {}
+      const img = String(body.image || "");
+      if (!img.startsWith("/9j/") || img.length > 1200000 || !/^[A-Za-z0-9+/=]+$/.test(img)) {
+        return json(env, { error: "Please send a JPEG photo (it is resized automatically)." }, 400);
+      }
+      try {
+        const path = `/repos/${env.GH_OWNER}/${env.SITE_REPO}/contents/profile.jpg`;
+        let sha;
+        try {
+          sha = (await gh(env, path)).sha;
+        } catch {}
+        await gh(env, path, {
+          method: "PUT",
+          body: JSON.stringify({ message: "Update profile photo via assistant", content: img, sha }),
+        });
+        // bump a version so browsers load the new photo instead of the cached one
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const { sha: dsha, data } = await readData(env);
+          data.profile = data.profile || {};
+          data.profile.photo_v = String(Date.now());
+          try {
+            await gh(env, `/repos/${env.GH_OWNER}/${env.SITE_REPO}/contents/data.json`, {
+              method: "PUT",
+              body: JSON.stringify({
+                message: "Bump profile photo version",
+                content: textToB64(JSON.stringify(data, null, 2) + "\n"),
+                sha: dsha,
+              }),
+            });
+            break;
+          } catch (e) {
+            if (!String(e.message).startsWith("409") || attempt === 2) throw e;
+          }
+        }
+        return json(env, { reply: "Profile photo updated. It shows on the site in a minute or two." });
+      } catch (e) {
+        return json(env, { error: e.message }, 500);
+      }
+    }
+
     if (url.pathname === "/quick") {
       if (!(await checkToken(env, req))) return json(env, { error: "Session expired" }, 401);
       let body = {};
