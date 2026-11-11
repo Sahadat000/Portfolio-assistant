@@ -593,9 +593,14 @@ async function testAi(env) {
   const gem = (key) => async () => {
     await callGemini(env, { contents: [{ role: "user", parts: [{ text: "Reply with: OK" }] }] }, key);
   };
-  if (env.GROQ_API_KEY)
-    await ping("Groq", compat("Groq", "https://api.groq.com/openai/v1/chat/completions", env.GROQ_API_KEY, env.GROQ_MODEL || "llama-3.3-70b-versatile"));
-  else lines.push("Groq: no key set");
+  if (env.GROQ_API_KEY) {
+    try {
+      const gm = await groqModel(env);
+      await ping(`Groq (${gm})`, compat("Groq", "https://api.groq.com/openai/v1/chat/completions", env.GROQ_API_KEY, gm));
+    } catch (e) {
+      lines.push("Groq: FAILED - " + String(e.message).slice(0, 160));
+    }
+  } else lines.push("Groq: no key set");
   if (env.OPENAI_API_KEY)
     await ping("OpenAI", compat("OpenAI", "https://api.openai.com/v1/chat/completions", env.OPENAI_API_KEY, env.OPENAI_MODEL || "gpt-4o-mini"));
   if (env.GEMINI_API_KEY) await ping("Gemini", gem(env.GEMINI_API_KEY));
@@ -724,6 +729,31 @@ async function chatGemini(env, messages, key) {
   return "Too many steps. Please try a simpler command.";
 }
 
+let groqModelCache = null;
+async function groqModel(env) {
+  if (env.GROQ_MODEL) return env.GROQ_MODEL;
+  if (groqModelCache && Date.now() - groqModelCache.t < 3600000) return groqModelCache.m;
+  const r = await fetch("https://api.groq.com/openai/v1/models", {
+    headers: { Authorization: "Bearer " + env.GROQ_API_KEY },
+    signal: AbortSignal.timeout(8000),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((d.error && d.error.message) || "Could not list Groq models (" + r.status + ")");
+  const ids = (d.data || []).filter((x) => x.active !== false).map((x) => x.id);
+  const prefs = [
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "llama-3.1-8b-instant",
+  ];
+  const m = prefs.find((p) => ids.includes(p)) || ids.find((i) => !/whisper|guard|tts|safeguard|orpheus|compound/i.test(i));
+  if (!m) throw new Error("No chat model is available on this Groq key");
+  groqModelCache = { m, t: Date.now() };
+  return m;
+}
+
 async function chatCompat(env, cfg, messages) {
   const tools = TOOLS.map((t) => ({
     type: "function",
@@ -748,7 +778,8 @@ async function chatCompat(env, cfg, messages) {
           tools,
           tool_choice: "auto",
           temperature: 0.2,
-          max_tokens: 700,
+          max_tokens: 900,
+          ...(/gpt-oss/.test(cfg.model) ? { reasoning_effort: "low" } : {}),
         }),
         signal: AbortSignal.timeout(15000),
       });
@@ -792,12 +823,14 @@ async function chat(env, messages, pref) {
       id: "groq",
       label: "Groq",
       run: () =>
-        chatCompat(env, {
-          name: "Groq",
-          url: "https://api.groq.com/openai/v1/chat/completions",
-          key: env.GROQ_API_KEY,
-          model: env.GROQ_MODEL || "llama-3.3-70b-versatile",
-        }, messages),
+        groqModel(env).then((model) =>
+          chatCompat(env, {
+            name: "Groq",
+            url: "https://api.groq.com/openai/v1/chat/completions",
+            key: env.GROQ_API_KEY,
+            model,
+          }, messages)
+        ),
     });
   }
   if (env.OPENAI_API_KEY) {
